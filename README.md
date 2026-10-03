@@ -357,6 +357,49 @@ docker run --rm \
 
 Connect to `/run/hark/hark.sock` inside the container. If an existing directory has mode `0700`, its owner may need to change it to `0750`. Clients need both directory search permission and the appropriate socket permissions. When using a dedicated shared group, ensure that the directory and socket have the same GID; setting the directory's setgid bit makes new sockets inherit its group. Rootless Docker and user namespaces also require compatible host-to-container UID/GID mappings.
 
+## Published container image
+
+After the Linux and macOS CI checks pass, each push to `main` (including a merged
+pull request) builds and publishes `ghcr.io/170/hark:latest` and
+`ghcr.io/170/hark:sha-<full-commit-sha>`. Images support `linux/amd64` and
+`linux/arm64` (including 64-bit Raspberry Pi OS). Pull requests build the image
+without publishing it. The workflow uses `GITHUB_TOKEN` with `packages: write`;
+no additional registry secret is required. After the first publication, set the
+package's visibility to **Public** in GitHub's package settings to allow anonymous
+pulls. Repository visibility alone does not make a new GHCR package public.
+
+The image includes ALSA and eSpeak NG and runs as UID/GID `10001:10001`. It starts
+`hark serve --socket /run/hark/hark.sock --websocket 0.0.0.0:8765`, with
+the model/feedback cache under `/var/cache/hark`. For example, on a Linux host:
+
+```bash
+docker network create hark
+docker volume create hark-cache
+docker run -d --name hark --restart unless-stopped \
+  --network hark \
+  --device /dev/snd \
+  --group-add "$(stat -c %g /dev/snd/controlC0)" \
+  --mount type=volume,src=hark-cache,dst=/var/cache/hark \
+  ghcr.io/170/hark:latest
+```
+
+Clients on the `hark` Docker network connect to `ws://hark:8765/ws`; no host port
+is published. Adjust the audio device group for your host. The container needs
+an available ALSA capture device; desktop audio servers may already hold it.
+To select a device, append
+`serve --socket /run/hark/hark.sock --websocket 0.0.0.0:8765 --device <device-name>`
+to the command. Arguments after the image replace its entire default command.
+Microphone access through macOS Docker Desktop is not supported by this setup.
+Architecture support does not establish detection accuracy or Raspberry Pi
+performance. The Linux Japanese synthesis limitations above still apply.
+
+To build locally without opening a microphone:
+
+```bash
+docker build -t hark:local .
+docker run --rm hark:local --help
+```
+
 ## macOS: LaunchAgent
 
 Replace `/Users/YOUR_USER` in `deploy/dev.hark.agent.plist` with your actual absolute paths. Install the binary, then save the plist under `~/Library/LaunchAgents/`. Neither `~` nor environment variables are expanded inside the plist.
