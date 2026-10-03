@@ -1,0 +1,6 @@
+/target/
+/models/
+/recordings/
+*.sock
+/.venv/
+__pycache__/

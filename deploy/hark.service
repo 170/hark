@@ -1,0 +1,16 @@
+[Unit]
+Description=Hark local wake-word detector
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hark serve --socket %t/hark/hark.sock
+Restart=on-failure
+RestartSec=3
+UMask=0007
+# Keep the directory inode stable across restarts for Docker bind mounts.
+# hark creates it as 0750 and removes only the socket on shutdown.
+
+[Install]
+WantedBy=default.target
