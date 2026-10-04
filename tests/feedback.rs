@@ -273,12 +273,222 @@ fn legacy_feedback_file_is_loaded_and_migrates_on_positive_report() {
         .apply_label(&id, Label::TruePositive, &words())
         .unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["version"], 3);
     let restored = Feedback::new(Some(directory.path().into())).unwrap();
     restored.register(model).unwrap();
     let negative = restored.record("hello", 0.04);
     assert_eq!(
         restored.apply(&negative, &words()).unwrap().status,
         "needs_examples"
+    );
+}
+
+#[test]
+fn acoustic_feedback_rejects_overlap_and_variants_without_tightening() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(common::model("hello"));
+    let feedback = Feedback::new(Some(directory.path().into())).unwrap();
+    feedback.register(model.clone()).unwrap();
+    let negative = vec![[0.14; 13]; 15];
+    let variant = vec![[0.145; 13]; 18];
+    let positive = vec![[0.11; 13]; 15];
+    let original = model.evaluate(&negative);
+    assert!(original.detected);
+    // This false match is too close to positives for the old threshold adjustment.
+    assert!(original.distance.unwrap() < 0.02);
+    let id = feedback
+        .record_with_features("hello", original.distance.unwrap(), &negative)
+        .unwrap();
+    let reply = feedback.apply(&id, &words()).unwrap();
+    assert_eq!(reply.status, "applied");
+    assert_eq!(reply.threshold, model.threshold);
+    assert_eq!(feedback.apply(&id, &words()).unwrap().status, "applied");
+    for sample in [&negative, &variant] {
+        let result = feedback.adjust_with_features("hello", model.evaluate(sample), sample);
+        assert!(!result.detected);
+        assert_eq!(result.reason, "matches_negative_example");
+    }
+    assert!(
+        feedback
+            .adjust_with_features("hello", model.evaluate(&positive), &positive)
+            .detected
+    );
+    let restored = Feedback::new(Some(directory.path().into())).unwrap();
+    restored.register(model.clone()).unwrap();
+    assert!(
+        !restored
+            .adjust_with_features("hello", model.evaluate(&variant), &variant)
+            .detected
+    );
+    let mut changed = (*model).clone();
+    changed.templates[0][0][0] += 0.001;
+    let rebuilt = Feedback::new(Some(directory.path().into())).unwrap();
+    rebuilt.register(Arc::new(changed.clone())).unwrap();
+    assert!(
+        rebuilt
+            .adjust_with_features("hello", changed.evaluate(&negative), &negative)
+            .detected
+    );
+    restored.reset("hello", &words()).unwrap();
+    let reset = Feedback::new(Some(directory.path().into())).unwrap();
+    reset.register(model.clone()).unwrap();
+    assert!(
+        reset
+            .adjust_with_features("hello", model.evaluate(&negative), &negative)
+            .detected
+    );
+}
+
+#[test]
+fn confirmed_acoustic_positive_is_protected_and_persisted() {
+    use hark::feedback::Label;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(common::model("hello"));
+    let feedback = Feedback::new(Some(directory.path().into())).unwrap();
+    feedback.register(model.clone()).unwrap();
+    let positive = vec![[0.15; 13]; 15];
+    let negative = vec![[0.14; 13]; 15];
+    let positive_id = feedback
+        .record_with_features(
+            "hello",
+            model.evaluate(&positive).distance.unwrap(),
+            &positive,
+        )
+        .unwrap();
+    let negative_id = feedback
+        .record_with_features(
+            "hello",
+            model.evaluate(&negative).distance.unwrap(),
+            &negative,
+        )
+        .unwrap();
+    feedback.apply(&negative_id, &words()).unwrap();
+    assert!(
+        !feedback
+            .adjust_with_features("hello", model.evaluate(&positive), &positive)
+            .detected
+    );
+    feedback
+        .apply_label(&positive_id, Label::TruePositive, &words())
+        .unwrap();
+    let restored = Feedback::new(Some(directory.path().into())).unwrap();
+    restored.register(model.clone()).unwrap();
+    assert!(
+        restored
+            .adjust_with_features("hello", model.evaluate(&positive), &positive)
+            .detected
+    );
+    assert!(
+        !restored
+            .adjust_with_features("hello", model.evaluate(&negative), &negative)
+            .detected
+    );
+    let conflict = restored
+        .record_with_features(
+            "hello",
+            model.evaluate(&positive).distance.unwrap(),
+            &positive,
+        )
+        .unwrap();
+    assert_eq!(
+        restored.apply(&conflict, &words()).unwrap().status,
+        "needs_examples"
+    );
+    for template in &model.templates {
+        let id = restored
+            .record_with_features("hello", 0.0, template)
+            .unwrap();
+        assert_eq!(
+            restored.apply(&id, &words()).unwrap().status,
+            "needs_examples"
+        );
+        assert!(
+            restored
+                .adjust_with_features("hello", model.evaluate(template), template)
+                .detected
+        );
+    }
+}
+
+#[test]
+fn acoustic_save_failure_leaves_detection_unchanged_and_can_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("feedback");
+    let model = Arc::new(common::model("hello"));
+    let feedback = Feedback::new(Some(root.clone())).unwrap();
+    feedback.register(model.clone()).unwrap();
+    let sample = vec![[0.14; 13]; 15];
+    let id = feedback
+        .record_with_features("hello", model.evaluate(&sample).distance.unwrap(), &sample)
+        .unwrap();
+    std::fs::write(&root, "blocked").unwrap();
+    assert!(feedback.apply(&id, &words()).is_err());
+    assert!(
+        feedback
+            .adjust_with_features("hello", model.evaluate(&sample), &sample)
+            .detected
+    );
+    std::fs::remove_file(root).unwrap();
+    feedback.apply(&id, &words()).unwrap();
+    assert!(
+        !feedback
+            .adjust_with_features("hello", model.evaluate(&sample), &sample)
+            .detected
+    );
+    assert!(
+        feedback
+            .record_with_features("hello", 0.0, &vec![[0.0; 13]; 301])
+            .is_err()
+    );
+    assert!(
+        feedback
+            .record_with_features("hello", 0.0, &vec![[f32::NAN; 13]; 15])
+            .is_err()
+    );
+}
+
+#[test]
+fn acoustic_examples_are_bounded_and_corrupt_saved_examples_are_rejected() {
+    use hark::feedback::Label;
+    let directory = tempfile::tempdir().unwrap();
+    let feedback = Feedback::new(Some(directory.path().into())).unwrap();
+    let model = Arc::new(common::model("hello"));
+    feedback.register(model.clone()).unwrap();
+    for i in 0..17 {
+        let sample = vec![[0.14 + i as f32 * 0.001; 13]; 15];
+        let id = feedback
+            .record_with_features("hello", model.evaluate(&sample).distance.unwrap(), &sample)
+            .unwrap();
+        feedback.apply(&id, &words()).unwrap();
+    }
+    for i in 0..17 {
+        let sample = vec![[0.105 + i as f32 * 0.001; 13]; 15];
+        let id = feedback
+            .record_with_features("hello", model.evaluate(&sample).distance.unwrap(), &sample)
+            .unwrap();
+        let reply = feedback
+            .apply_label(&id, Label::TruePositive, &words())
+            .unwrap();
+        assert_eq!(
+            reply.status,
+            if i < 16 { "recorded" } else { "needs_examples" }
+        );
+    }
+    let path = directory.path().join("v1/68656c6c6f/threshold.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["examples"]["negatives"].as_array().unwrap().len(), 16);
+    assert_eq!(saved["examples"]["positives"].as_array().unwrap().len(), 16);
+    let first = saved["examples"]["negatives"][0][0][0].as_f64().unwrap();
+    assert!((first - 0.141).abs() < 0.00001);
+    saved["examples"]["negatives"][0] = serde_json::json!([]);
+    std::fs::write(path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let restored = Feedback::new(Some(directory.path().into())).unwrap();
+    assert!(
+        restored
+            .register(model)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid saved acoustic")
     );
 }

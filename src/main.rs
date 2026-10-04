@@ -164,9 +164,11 @@ fn detect(
                             {
                                 continue;
                             }
-                            let result = models
-                                .feedback
-                                .adjust(&model.word, model.evaluate(&features));
+                            let result = models.feedback.adjust_with_features(
+                                &model.word,
+                                model.evaluate(&features),
+                                &features,
+                            );
                             if diagnostics {
                                 eprintln!(
                                     "{}",
@@ -177,9 +179,11 @@ fn detect(
                                 last_detection.insert(model.word.clone(), Instant::now());
                                 hub.publish(Event {
                                     event: "detected".into(),
-                                    event_id: models
-                                        .feedback
-                                        .record(&model.word, result.distance.unwrap()),
+                                    event_id: models.feedback.record_with_features(
+                                        &model.word,
+                                        result.distance.unwrap(),
+                                        &features,
+                                    )?,
                                     word: model.word.clone(),
                                     ts: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),
                                     score: result.score,
