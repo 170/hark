@@ -1,5 +1,5 @@
-//! Explicit feedback tunes and protects thresholds without retaining microphone audio.
-use crate::engine::{MatchResult, Model};
+//! Explicit feedback retains bounded acoustic examples, never microphone waveforms.
+use crate::engine::{Features, MatchResult, Model, distance};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +12,9 @@ use std::{
 };
 
 const HISTORY_LIMIT: usize = 256;
+const EXAMPLE_LIMIT: usize = 16;
+const NEGATIVE_RADIUS: f32 = 0.05;
+
 const HISTORY_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,18 +60,47 @@ mod tests {
     }
 }
 
+#[derive(Clone)]
 struct Detection {
     id: String,
     word: String,
     distance: f32,
+    features: Option<Features>,
     created: Instant,
     reply: Option<FeedbackReply>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Examples {
+    negatives: Vec<Features>,
+    positives: Vec<Features>,
+}
+
+fn valid_features(features: &Features) -> bool {
+    (15..=300).contains(&features.len()) && features.iter().flatten().all(|v| v.is_finite())
+}
+
+impl Examples {
+    fn rejects(&self, sample: &Features, positive_distance: f32) -> bool {
+        let positive = self
+            .positives
+            .iter()
+            .map(|p| distance(sample, p))
+            .fold(positive_distance, f32::min);
+        self.negatives.iter().any(|n| {
+            let d = distance(sample, n);
+            d <= NEGATIVE_RADIUS && d + f32::EPSILON < positive * 0.5
+        })
+    }
+}
+
+#[derive(Clone)]
 struct TunedModel {
     base: Arc<Model>,
     threshold: f32,
     positive_distance: Option<f32>,
+    examples: Examples,
 }
 
 #[derive(Default)]
@@ -87,6 +119,8 @@ struct SavedThreshold {
     threshold: f32,
     #[serde(default)]
     positive_distance: Option<f32>,
+    #[serde(default)]
+    examples: Examples,
 }
 
 pub struct Feedback {
@@ -127,6 +161,7 @@ impl Feedback {
     pub fn register(&self, model: Arc<Model>) -> Result<()> {
         let mut threshold = model.threshold;
         let mut positive_distance = None;
+        let mut examples = Examples::default();
         if let Some(path) = self.path(&model.word) {
             match File::open(&path) {
                 Ok(file) => {
@@ -137,7 +172,7 @@ impl Feedback {
                     let saved: SavedThreshold = serde_json::from_reader(file)
                         .with_context(|| format!("read feedback {}", path.display()))?;
                     ensure!(
-                        matches!(saved.version, 1 | 2),
+                        matches!(saved.version, 1..=3),
                         "unsupported feedback version"
                     );
                     if saved.base == *model {
@@ -155,6 +190,18 @@ impl Feedback {
                                 .is_none_or(|d| d.is_finite() && d >= 0.0 && d <= saved.threshold),
                             "invalid saved positive distance"
                         );
+                        ensure!(
+                            saved.examples.negatives.len() <= EXAMPLE_LIMIT
+                                && saved.examples.positives.len() <= EXAMPLE_LIMIT
+                                && saved
+                                    .examples
+                                    .negatives
+                                    .iter()
+                                    .chain(&saved.examples.positives)
+                                    .all(valid_features),
+                            "invalid saved acoustic examples"
+                        );
+                        examples = saved.examples;
                         threshold = saved.threshold;
                         positive_distance = saved.positive_distance;
                     } else {
@@ -171,6 +218,7 @@ impl Feedback {
                 base: model,
                 threshold,
                 positive_distance,
+                examples,
             },
         );
         Ok(())
@@ -190,7 +238,50 @@ impl Feedback {
         result
     }
 
+    /// Compare bounded negative examples outside the state lock (DTW can be expensive).
+    pub fn adjust_with_features(
+        &self,
+        word: &str,
+        result: MatchResult,
+        features: &Features,
+    ) -> MatchResult {
+        let mut result = self.adjust(word, result);
+        if !result.detected || !valid_features(features) {
+            return result;
+        }
+        let examples = self
+            .state
+            .lock()
+            .unwrap()
+            .models
+            .get(word)
+            .map(|m| m.examples.clone());
+        if examples.is_some_and(|e| e.rejects(features, result.distance.unwrap())) {
+            result.detected = false;
+            result.reason = "matches_negative_example";
+        }
+        result
+    }
+
+    pub fn record_with_features(
+        &self,
+        word: &str,
+        distance: f32,
+        features: &Features,
+    ) -> Result<String> {
+        ensure!(valid_features(features), "invalid detection features");
+        ensure!(
+            distance.is_finite() && distance >= 0.0,
+            "invalid detection distance"
+        );
+        Ok(self.record_inner(word, distance, Some(features.clone())))
+    }
+
     pub fn record(&self, word: &str, distance: f32) -> String {
+        self.record_inner(word, distance, None)
+    }
+
+    fn record_inner(&self, word: &str, distance: f32, features: Option<Features>) -> String {
         let mut state = self.state.lock().unwrap();
         Self::prune(&mut state);
         while state.history.len() >= HISTORY_LIMIT {
@@ -202,6 +293,7 @@ impl Feedback {
             id: id.clone(),
             word: word.into(),
             distance,
+            features,
             created: Instant::now(),
             reply: None,
         });
@@ -233,13 +325,14 @@ impl Feedback {
             .writer
             .try_lock()
             .map_err(|_| anyhow::anyhow!("feedback busy; retry"))?;
-        let (base, positive_distance, reply) = {
+        let (base, positive_distance, examples, reply) = {
             let mut state = self.state.lock().unwrap();
             Self::prune(&mut state);
             let event = state
                 .history
                 .iter()
                 .find(|event| event.id == event_id)
+                .cloned()
                 .context("unknown or expired event_id")?;
             ensure!(words.contains(&event.word), "event word is not subscribed");
             if let Some(reply) = &event.reply {
@@ -249,11 +342,19 @@ impl Feedback {
                 );
                 return Ok(reply.clone());
             }
-            let tuned = state.models.get(&event.word).context("model unavailable")?;
+            let tuned = state
+                .models
+                .get(&event.word)
+                .cloned()
+                .context("model unavailable")?;
+            drop(state);
             let lower = floor(&tuned.base).max(tuned.positive_distance.unwrap_or(0.0));
             let mut positive_distance = tuned.positive_distance;
+            let mut examples = tuned.examples.clone();
             let (status, threshold) = if label == Label::TruePositive {
-                if event.distance > tuned.threshold {
+                if event.distance > tuned.threshold
+                    || (event.features.is_some() && examples.positives.len() >= EXAMPLE_LIMIT)
+                {
                     // Do not silently undo an earlier negative adjustment.
                     ("needs_examples", tuned.threshold)
                 } else {
@@ -261,8 +362,30 @@ impl Feedback {
                         event.distance.is_finite() && event.distance >= 0.0,
                         "invalid event distance"
                     );
+                    if let Some(features) = &event.features {
+                        examples.positives.push(features.clone());
+                    }
                     positive_distance = Some(positive_distance.unwrap_or(0.0).max(event.distance));
                     ("recorded", tuned.threshold)
+                }
+            } else if let Some(features) = &event.features {
+                // Retain hard negatives even inside the protected positive distance range.
+                // An indistinguishable known positive cannot safely become a negative.
+                let nearest_positive = tuned
+                    .base
+                    .templates
+                    .iter()
+                    .chain(&examples.positives)
+                    .map(|p| distance(features, p))
+                    .fold(f32::INFINITY, f32::min);
+                if nearest_positive <= 2.0 * f32::EPSILON {
+                    ("needs_examples", tuned.threshold)
+                } else {
+                    if examples.negatives.len() == EXAMPLE_LIMIT {
+                        examples.negatives.remove(0);
+                    }
+                    examples.negatives.push(features.clone());
+                    ("applied", tuned.threshold)
                 }
             } else if event.distance > tuned.threshold {
                 ("unchanged", tuned.threshold)
@@ -276,6 +399,7 @@ impl Feedback {
             (
                 tuned.base.clone(),
                 positive_distance,
+                examples,
                 FeedbackReply {
                     event: "feedback_result",
                     event_id: event_id.into(),
@@ -294,10 +418,11 @@ impl Feedback {
                 serde_json::to_writer(
                     &mut temporary,
                     &SavedThreshold {
-                        version: 2,
+                        version: 3,
                         base: (*base).clone(),
                         threshold: reply.threshold,
                         positive_distance,
+                        examples: examples.clone(),
                     },
                 )?;
                 temporary.flush()?;
@@ -308,6 +433,7 @@ impl Feedback {
             let tuned = state.models.get_mut(&reply.word).unwrap();
             tuned.threshold = reply.threshold;
             tuned.positive_distance = positive_distance;
+            tuned.examples = examples;
         }
         let mut state = self.state.lock().unwrap();
         if let Some(event) = state.history.iter_mut().find(|event| event.id == event_id) {
@@ -342,6 +468,7 @@ impl Feedback {
         let tuned = state.models.get_mut(word).unwrap();
         tuned.threshold = threshold;
         tuned.positive_distance = None;
+        tuned.examples = Examples::default();
         state.history.retain(|event| event.word != word);
         Ok(ResetReply {
             event: "reset_result",
